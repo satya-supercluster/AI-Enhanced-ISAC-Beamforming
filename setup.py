@@ -9,7 +9,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 setup(
     name="ai-enhanced-isac-beamforming",
     version="1.0.0",
-    author="Your Name",
+    author="Satyam Gupta",
     author_email="your.email@university.edu",
     description="AI-Enhanced Beamforming for Energy-Efficient ISAC Systems",
     long_description=long_description,
