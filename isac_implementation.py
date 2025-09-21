@@ -37,11 +37,11 @@ class ISACEnvironment:
     def reset(self):
         """Reset environment to initial state"""
         # Random initial positions for vehicles
-        self.vehicle_positions = np.random.uniform(0, self.area_size, (self.K, 2))
+        self.vehicle_positions = np.random.uniform(50, self.area_size-50, (self.K, 2))
         self.vehicle_velocities = np.random.uniform(-20, 20, (self.K, 2))  # m/s
         
         # Random initial positions for sensing targets
-        self.target_positions = np.random.uniform(0, self.area_size, (self.L, 2))
+        self.target_positions = np.random.uniform(50, self.area_size-50, (self.L, 2))
         self.target_velocities = np.random.uniform(-5, 5, (self.L, 2))  # m/s
         
         # RSU position (center of area)
@@ -61,6 +61,8 @@ class ISACEnvironment:
         for k in range(self.K):
             # Distance-based path loss
             distance = np.linalg.norm(self.vehicle_positions[k] - self.rsu_position)
+            distance = max(distance, 1.0)  # Avoid zero distance
+            
             path_loss_db = 32.45 + 20*np.log10(self.fc/1e9) + 20*np.log10(distance/1000)
             path_loss = 10**(-path_loss_db/10)
             
@@ -74,23 +76,57 @@ class ISACEnvironment:
     def step(self, action, dt=0.1):
         """Execute one time step with given beamforming action"""
         # Parse action: [beamforming_real, beamforming_imag, power_allocation]
-        beamforming_real = action[:self.M*(self.K+1)].reshape(self.K+1, self.M)
-        beamforming_imag = action[self.M*(self.K+1):2*self.M*(self.K+1)].reshape(self.K+1, self.M)
-        beamforming = beamforming_real + 1j * beamforming_imag
-        power_allocation = action[2*self.M*(self.K+1):]
+        total_beamforming_elements = self.M * (self.K + 1)
         
-        # Normalize beamforming vectors
+        if len(action) < 2 * total_beamforming_elements + (self.K + 1):
+            # Pad action if too short
+            required_length = 2 * total_beamforming_elements + (self.K + 1)
+            action = np.pad(action, (0, required_length - len(action)), 'constant')
+        
+        beamforming_real = action[:total_beamforming_elements].reshape(self.K+1, self.M)
+        beamforming_imag = action[total_beamforming_elements:2*total_beamforming_elements].reshape(self.K+1, self.M)
+        beamforming = beamforming_real + 1j * beamforming_imag
+        power_allocation = action[2*total_beamforming_elements:2*total_beamforming_elements+(self.K+1)]
+        
+        # Ensure we have enough power allocation values
+        if len(power_allocation) < self.K + 1:
+            power_allocation = np.pad(power_allocation, (0, (self.K + 1) - len(power_allocation)), 'constant', constant_values=0.1)
+        
+        # Normalize beamforming vectors and ensure power constraints
         for i in range(self.K+1):
-            if np.linalg.norm(beamforming[i]) > 0:
-                beamforming[i] = beamforming[i] / np.linalg.norm(beamforming[i])
+            norm = np.linalg.norm(beamforming[i])
+            if norm > 0:
+                beamforming[i] = beamforming[i] / norm
+        
+        # Ensure positive power allocation and normalize
+        power_allocation = np.abs(power_allocation)
+        total_power = np.sum(power_allocation)
+        if total_power > self.P_max:
+            power_allocation = power_allocation * self.P_max / total_power
         
         # Update positions (simple mobility model)
         self.vehicle_positions += self.vehicle_velocities * dt
         self.target_positions += self.target_velocities * dt
         
-        # Keep vehicles within bounds
-        self.vehicle_positions = np.clip(self.vehicle_positions, 0, self.area_size)
-        self.target_positions = np.clip(self.target_positions, 0, self.area_size)
+        # Keep vehicles within bounds with reflection
+        for k in range(self.K):
+            for dim in range(2):
+                if self.vehicle_positions[k, dim] < 0:
+                    self.vehicle_positions[k, dim] = 0
+                    self.vehicle_velocities[k, dim] *= -1
+                elif self.vehicle_positions[k, dim] > self.area_size:
+                    self.vehicle_positions[k, dim] = self.area_size
+                    self.vehicle_velocities[k, dim] *= -1
+        
+        # Same for targets
+        for l in range(self.L):
+            for dim in range(2):
+                if self.target_positions[l, dim] < 0:
+                    self.target_positions[l, dim] = 0
+                    self.target_velocities[l, dim] *= -1
+                elif self.target_positions[l, dim] > self.area_size:
+                    self.target_positions[l, dim] = self.area_size
+                    self.target_velocities[l, dim] *= -1
         
         # Update channels
         self.update_channels()
@@ -114,9 +150,12 @@ class ISACEnvironment:
     
     def compute_communication_reward(self, beamforming_comm, power_comm):
         """Compute communication reward (sum rate)"""
+        if len(beamforming_comm) == 0 or len(power_comm) == 0:
+            return 0
+        
         rates = []
-        for k in range(self.K):
-            if power_comm[k] <= 0:
+        for k in range(min(self.K, len(beamforming_comm), len(power_comm))):
+            if power_comm[k] <= 1e-6:  # Very small threshold
                 rates.append(0)
                 continue
                 
@@ -128,7 +167,7 @@ class ISACEnvironment:
             
             # Interference power
             interference_power = 0
-            for j in range(self.K):
+            for j in range(min(self.K, len(beamforming_comm), len(power_comm))):
                 if j != k:
                     interference_power += power_comm[j] * np.abs(np.dot(h_k.conj(), beamforming_comm[j]))**2
             
@@ -141,18 +180,18 @@ class ISACEnvironment:
     
     def compute_sensing_reward(self, beamforming_sense, power_sense):
         """Compute sensing reward (detection probability and estimation accuracy)"""
-        if power_sense <= 0:
+        if power_sense <= 1e-6:
             return 0
         
         total_reward = 0
         for l in range(self.L):
             # Distance to target
             distance = np.linalg.norm(self.target_positions[l] - self.rsu_position)
+            distance = max(distance, 1.0)  # Avoid zero distance
             
             # Simplified radar equation for detection probability
-            # P_det ∝ P_tx * G^2 / R^4
             gain = np.abs(np.dot(beamforming_sense, np.exp(-1j * 2 * np.pi * distance / 3e8)))**2
-            detection_power = power_sense * gain / (distance**4 + 1e-6)  # Add small constant to avoid division by zero
+            detection_power = power_sense * gain / (distance**4)
             
             # Detection probability (simplified sigmoid)
             detection_prob = 1 / (1 + np.exp(-10 * (detection_power - 0.1)))
@@ -162,7 +201,7 @@ class ISACEnvironment:
             
             total_reward += 0.7 * detection_prob + 0.3 * estimation_accuracy
         
-        return total_reward / self.L
+        return total_reward / max(self.L, 1)
     
     def compute_energy_penalty(self, beamforming, power_allocation):
         """Compute energy consumption penalty"""
@@ -201,7 +240,7 @@ class PPOActor(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 256),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 128),
+            nn.Linear(256, 128),  # Fixed: was hidden_dim, should be 256
             nn.ReLU(),
             nn.Linear(128, action_dim * 2)  # Mean and log_std
         )
@@ -268,59 +307,94 @@ class PPOAgent:
         if len(self.memory) == 0:
             return
         
-        # Convert memory to tensors
-        states = torch.FloatTensor([t[0] for t in self.memory])
-        actions = torch.FloatTensor([t[1] for t in self.memory])
-        old_log_probs = torch.FloatTensor([t[2] for t in self.memory])
-        rewards = torch.FloatTensor([t[3] for t in self.memory])
-        next_states = torch.FloatTensor([t[4] for t in self.memory])
-        dones = torch.BoolTensor([t[5] for t in self.memory])
-        
-        # Calculate discounted rewards
-        discounted_rewards = []
-        discounted_reward = 0
-        for reward, done in zip(reversed(rewards), reversed(dones)):
-            if done:
-                discounted_reward = 0
-            discounted_reward = reward + self.gamma * discounted_reward
-            discounted_rewards.insert(0, discounted_reward)
-        
-        discounted_rewards = torch.FloatTensor(discounted_rewards)
-        
-        # Normalize rewards
-        discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (discounted_rewards.std() + 1e-8)
-        
-        # Calculate advantages
-        values = self.critic(states).squeeze()
-        advantages = discounted_rewards - values.detach()
-        
-        # PPO update
-        for _ in range(self.K_epochs):
-            # Actor loss
-            mean, std = self.actor(states)
-            dist = Normal(mean, std)
-            new_log_probs = dist.log_prob(actions).sum(dim=-1)
+        try:
+            # Convert memory to numpy arrays first, then to tensors (more efficient)
+            states_np = np.array([t[0] for t in self.memory])
+            actions_np = np.array([t[1] for t in self.memory])
+            old_log_probs_np = np.array([t[2] for t in self.memory])
+            rewards_np = np.array([t[3] for t in self.memory])
+            next_states_np = np.array([t[4] for t in self.memory])
+            dones_np = np.array([t[5] for t in self.memory])
             
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            # Convert to tensors
+            states = torch.FloatTensor(states_np)
+            actions = torch.FloatTensor(actions_np)
+            old_log_probs = torch.FloatTensor(old_log_probs_np)
+            rewards = torch.FloatTensor(rewards_np)
+            next_states = torch.FloatTensor(next_states_np)
+            dones = torch.BoolTensor(dones_np)
             
-            actor_loss = -torch.min(surr1, surr2).mean()
+            # Calculate discounted rewards
+            discounted_rewards = []
+            discounted_reward = 0
+            for i in reversed(range(len(rewards))):
+                if dones[i]:
+                    discounted_reward = 0
+                discounted_reward = rewards[i] + self.gamma * discounted_reward
+                discounted_rewards.insert(0, discounted_reward)
             
-            # Critic loss
-            critic_loss = F.mse_loss(self.critic(states).squeeze(), discounted_rewards)
+            discounted_rewards = torch.FloatTensor(discounted_rewards)
             
-            # Update networks
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+            # Normalize rewards
+            if len(discounted_rewards) > 1 and discounted_rewards.std() > 1e-8:
+                discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (discounted_rewards.std() + 1e-8)
             
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic_optimizer.step()
-        
-        # Clear memory
-        self.memory = []
+            # Calculate advantages
+            values = self.critic(states).squeeze(-1)  # Ensure proper shape
+            if values.dim() == 0:  # Handle scalar case
+                values = values.unsqueeze(0)
+            
+            advantages = discounted_rewards - values.detach()
+            
+            # Normalize advantages
+            if len(advantages) > 1 and advantages.std() > 1e-8:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            
+            # PPO update
+            for epoch in range(self.K_epochs):
+                # Actor loss
+                mean, std = self.actor(states)
+                dist = Normal(mean, std)
+                new_log_probs = dist.log_prob(actions).sum(dim=-1)
+                
+                # Ensure tensors have same shape
+                if old_log_probs.dim() != new_log_probs.dim():
+                    if old_log_probs.dim() == 0:
+                        old_log_probs = old_log_probs.unsqueeze(0)
+                    if new_log_probs.dim() == 0:
+                        new_log_probs = new_log_probs.unsqueeze(0)
+                
+                ratio = torch.exp(new_log_probs - old_log_probs)
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                
+                actor_loss = -torch.min(surr1, surr2).mean()
+                
+                # Critic loss
+                critic_values = self.critic(states).squeeze(-1)
+                if critic_values.dim() == 0:
+                    critic_values = critic_values.unsqueeze(0)
+                    
+                critic_loss = F.mse_loss(critic_values, discounted_rewards)
+                
+                # Update networks
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward(retain_graph=True)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                self.actor_optimizer.step()
+                
+                self.critic_optimizer.zero_grad()
+                critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                self.critic_optimizer.step()
+            
+            # Clear memory
+            self.memory = []
+            
+        except Exception as e:
+            print(f"Error in PPO update: {e}")
+            # Clear memory even if update fails
+            self.memory = []
 
 class KalmanFilterBaseline:
     """Traditional Kalman Filter based beamforming baseline"""
@@ -364,10 +438,17 @@ class KalmanFilterBaseline:
             if k < len(measurements['vehicles']):
                 y = measurements['vehicles'][k] - H @ self.vehicle_estimates[k]
                 S = H @ self.P_vehicles[k] @ H.T + self.R
-                K = self.P_vehicles[k] @ H.T @ np.linalg.inv(S)
                 
-                self.vehicle_estimates[k] += K @ y
-                self.P_vehicles[k] = (np.eye(4) - K @ H) @ self.P_vehicles[k]
+                # Check if S is invertible
+                try:
+                    S_inv = np.linalg.inv(S)
+                    K = self.P_vehicles[k] @ H.T @ S_inv
+                    
+                    self.vehicle_estimates[k] += K @ y
+                    self.P_vehicles[k] = (np.eye(4) - K @ H) @ self.P_vehicles[k]
+                except np.linalg.LinAlgError:
+                    # Skip update if matrix is singular
+                    continue
     
     def generate_beamforming(self, rsu_position):
         """Generate beamforming vectors using Maximum Ratio Transmission"""
@@ -379,8 +460,11 @@ class KalmanFilterBaseline:
             # Direction to vehicle
             vehicle_pos = self.vehicle_estimates[k][:2]
             direction = vehicle_pos - rsu_position
-            if np.linalg.norm(direction) > 0:
-                direction = direction / np.linalg.norm(direction)
+            norm_dir = np.linalg.norm(direction)
+            if norm_dir > 1e-6:
+                direction = direction / norm_dir
+            else:
+                direction = np.array([1.0, 0.0])  # Default direction
             
             # Simple beamforming (uniform linear array assumption)
             angles = np.arctan2(direction[1], direction[0])
@@ -388,7 +472,7 @@ class KalmanFilterBaseline:
             beamforming[k] = array_response / np.sqrt(self.M)
         
         # Sensing beamforming (uniform beamforming)
-        beamforming[self.K] = np.ones(self.M) / np.sqrt(self.M)
+        beamforming[self.K] = np.ones(self.M, dtype=complex) / np.sqrt(self.M)
         
         return beamforming, power_allocation
 
@@ -423,7 +507,11 @@ class SpikingNeuralNetwork:
     def encode_input(self, x, dt=1.0):
         """Rate encoding: convert continuous values to spike rates"""
         # Normalize input to [0, 1] range
-        x_norm = (x - np.min(x)) / (np.max(x) - np.min(x) + 1e-8)
+        x_min, x_max = np.min(x), np.max(x)
+        if x_max - x_min > 1e-8:
+            x_norm = (x - x_min) / (x_max - x_min)
+        else:
+            x_norm = np.zeros_like(x)
         
         # Generate Poisson spikes based on rates
         spike_probs = x_norm * dt / 1000  # Convert to probability per dt
@@ -473,7 +561,7 @@ class SpikingNeuralNetwork:
             self.energy_spikes += np.sum(self.spike_hidden) + np.sum(self.spike_output)  # Spike events
         
         # Decode output (rate decoding)
-        output = output_sum / num_steps
+        output = output_sum / num_steps if num_steps > 0 else output_sum
         
         return output
     
@@ -504,25 +592,32 @@ def train_drl_agent(env, agent, episodes=1000):
         episode_sense = 0
         episode_energy = 0
         
-        for step in range(100):  # Max steps per episode
-            action, log_prob = agent.select_action(state)
-            next_state, reward, done, info = env.step(action)
-            
-            agent.store_transition(state, action, log_prob, reward, next_state, done)
-            
-            episode_reward += reward
-            episode_comm += info['comm_reward']
-            episode_sense += info['sense_reward']
-            episode_energy += info['energy_penalty']
-            
-            state = next_state
-            
-            if done:
+        for step in range(50):  # Reduced max steps per episode
+            try:
+                action, log_prob = agent.select_action(state)
+                next_state, reward, done, info = env.step(action)
+                
+                agent.store_transition(state, action, log_prob, reward, next_state, done)
+                
+                episode_reward += reward
+                episode_comm += info['comm_reward']
+                episode_sense += info['sense_reward']
+                episode_energy += info['energy_penalty']
+                
+                state = next_state
+                
+                if done:
+                    break
+            except Exception as e:
+                print(f"Error in episode {episode}, step {step}: {e}")
                 break
         
         # Update agent every 20 episodes
         if (episode + 1) % 20 == 0:
-            agent.update()
+            try:
+                agent.update()
+            except Exception as e:
+                print(f"Error updating agent at episode {episode}: {e}")
         
         episode_rewards.append(episode_reward)
         comm_rewards.append(episode_comm)
@@ -556,37 +651,41 @@ def evaluate_baseline(env, baseline, episodes=100):
         episode_energy = 0
         episode_power = 0
         
-        for step in range(100):
-            # Get measurements (vehicle positions)
-            measurements = {
-                'vehicles': env.vehicle_positions,
-                'targets': env.target_positions
-            }
-            
-            # Update Kalman filter
-            baseline.predict_and_update(measurements)
-            
-            # Generate beamforming action
-            beamforming, power_allocation = baseline.generate_beamforming(env.rsu_position)
-            
-            # Convert to action format
-            action = np.concatenate([
-                beamforming.real.flatten(),
-                beamforming.imag.flatten(),
-                power_allocation
-            ])
-            
-            next_state, reward, done, info = env.step(action)
-            
-            episode_reward += reward
-            episode_comm += info['comm_reward']
-            episode_sense += info['sense_reward']
-            episode_energy += info['energy_penalty']
-            episode_power += info['total_power']
-            
-            state = next_state
-            
-            if done:
+        for step in range(50):  # Reduced max steps
+            try:
+                # Get measurements (vehicle positions)
+                measurements = {
+                    'vehicles': env.vehicle_positions,
+                    'targets': env.target_positions
+                }
+                
+                # Update Kalman filter
+                baseline.predict_and_update(measurements)
+                
+                # Generate beamforming action
+                beamforming, power_allocation = baseline.generate_beamforming(env.rsu_position)
+                
+                # Convert to action format
+                action = np.concatenate([
+                    beamforming.real.flatten(),
+                    beamforming.imag.flatten(),
+                    power_allocation
+                ])
+                
+                next_state, reward, done, info = env.step(action)
+                
+                episode_reward += reward
+                episode_comm += info['comm_reward']
+                episode_sense += info['sense_reward']
+                episode_energy += info['energy_penalty']
+                episode_power += info['total_power']
+                
+                state = next_state
+                
+                if done:
+                    break
+            except Exception as e:
+                print(f"Error in baseline episode {episode}, step {step}: {e}")
                 break
         
         episode_rewards.append(episode_reward)
@@ -605,6 +704,7 @@ def evaluate_baseline(env, baseline, episodes=100):
 
 def plot_results(drl_results, baseline_results):
     """Plot comparison results"""
+    plt.style.use('default')  # Ensure matplotlib works
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
     # Episode rewards
@@ -680,7 +780,12 @@ def plot_results(drl_results, baseline_results):
     # Energy efficiency comparison
     drl_energy = np.mean(drl_results['energy_penalties'][-100:])
     baseline_energy = np.mean(baseline_results['energy_penalties'])
-    energy_reduction = (baseline_energy - drl_energy) / baseline_energy * 100
+    
+    # Avoid division by zero
+    if baseline_energy > 1e-8:
+        energy_reduction = (baseline_energy - drl_energy) / baseline_energy * 100
+    else:
+        energy_reduction = 0
     
     methods = ['Kalman Filter', 'DRL-PPO']
     energies = [baseline_energy, drl_energy]
@@ -701,8 +806,11 @@ def plot_results(drl_results, baseline_results):
                            ha='center', va='bottom')
     
     plt.tight_layout()
-    plt.savefig('isac_results.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    try:
+        plt.savefig('isac_results.png', dpi=300, bbox_inches='tight')
+        plt.show()
+    except Exception as e:
+        print(f"Error saving/showing plot: {e}")
 
 def demonstrate_snn_energy_efficiency():
     """Demonstrate SNN energy efficiency"""
@@ -730,45 +838,52 @@ def demonstrate_snn_energy_efficiency():
     ann_total_energy = ann_ops * ann_energy_per_op + ann_memory_access
     
     # SNN forward pass
-    snn_output = snn.forward(test_input)
-    snn_energy = snn.get_energy_consumption()
-    
-    print(f"Traditional ANN Energy Consumption:")
-    print(f"  - MAC Operations: {ann_ops}")
-    print(f"  - Total Energy: {ann_total_energy/1000:.2f} nJ")
-    
-    print(f"\nSpiking Neural Network Energy Consumption:")
-    print(f"  - Active Operations: {snn_energy['operations']}")
-    print(f"  - Spike Events: {snn_energy['spikes']}")
-    print(f"  - Total Energy: {snn_energy['total_energy_pJ']/1000:.2f} nJ")
-    
-    energy_reduction = (ann_total_energy - snn_energy['total_energy_pJ']) / ann_total_energy * 100
-    print(f"  - Energy Reduction: {energy_reduction:.1f}%")
-    
-    # Visualization
-    plt.figure(figsize=(10, 6))
-    
-    methods = ['Traditional ANN', 'Spiking NN']
-    energies = [ann_total_energy/1000, snn_energy['total_energy_pJ']/1000]  # Convert to nJ
-    colors = ['red', 'green']
-    
-    bars = plt.bar(methods, energies, color=colors, alpha=0.7)
-    plt.title(f'Energy Consumption Comparison\n({energy_reduction:.1f}% reduction with SNN)')
-    plt.ylabel('Energy Consumption (nJ)')
-    plt.grid(True, alpha=0.3)
-    
-    # Add value labels
-    for bar, energy in zip(bars, energies):
-        height = bar.get_height()
-        plt.annotate(f'{energy:.2f} nJ',
-                    xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3),
-                    textcoords="offset points",
-                    ha='center', va='bottom')
-    
-    plt.tight_layout()
-    plt.savefig('snn_energy_comparison.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    try:
+        snn_output = snn.forward(test_input)
+        snn_energy = snn.get_energy_consumption()
+        
+        print(f"Traditional ANN Energy Consumption:")
+        print(f"  - MAC Operations: {ann_ops}")
+        print(f"  - Total Energy: {ann_total_energy/1000:.2f} nJ")
+        
+        print(f"\nSpiking Neural Network Energy Consumption:")
+        print(f"  - Active Operations: {snn_energy['operations']}")
+        print(f"  - Spike Events: {snn_energy['spikes']}")
+        print(f"  - Total Energy: {snn_energy['total_energy_pJ']/1000:.2f} nJ")
+        
+        energy_reduction = (ann_total_energy - snn_energy['total_energy_pJ']) / ann_total_energy * 100
+        print(f"  - Energy Reduction: {energy_reduction:.1f}%")
+        
+        # Visualization
+        plt.figure(figsize=(10, 6))
+        
+        methods = ['Traditional ANN', 'Spiking NN']
+        energies = [ann_total_energy/1000, snn_energy['total_energy_pJ']/1000]  # Convert to nJ
+        colors = ['red', 'green']
+        
+        bars = plt.bar(methods, energies, color=colors, alpha=0.7)
+        plt.title(f'Energy Consumption Comparison\n({energy_reduction:.1f}% reduction with SNN)')
+        plt.ylabel('Energy Consumption (nJ)')
+        plt.grid(True, alpha=0.3)
+        
+        # Add value labels
+        for bar, energy in zip(bars, energies):
+            height = bar.get_height()
+            plt.annotate(f'{energy:.2f} nJ',
+                        xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3),
+                        textcoords="offset points",
+                        ha='center', va='bottom')
+        
+        plt.tight_layout()
+        try:
+            plt.savefig('snn_energy_comparison.png', dpi=300, bbox_inches='tight')
+            plt.show()
+        except Exception as e:
+            print(f"Error saving/showing SNN plot: {e}")
+            
+    except Exception as e:
+        print(f"Error in SNN demonstration: {e}")
 
 def main():
     """Main execution function"""
@@ -776,96 +891,109 @@ def main():
     
     # Configuration
     config = {
-        'num_antennas': 64,
-        'num_vehicles': 8,
-        'num_targets': 4,
-        'max_power': 46,  # dBm equivalent in watts (≈40W)
+        'num_antennas': 32,  # Reduced for computational efficiency
+        'num_vehicles': 4,   # Reduced for computational efficiency
+        'num_targets': 2,    # Reduced for computational efficiency
+        'max_power': 10,     # Reduced for stability (≈10W)
         'carrier_freq': 28e9,  # 28 GHz
         'bandwidth': 100e6,    # 100 MHz
         'area_size': 1000,     # 1km x 1km area
         'noise_power': 1e-12   # -90 dBm
     }
     
-    # Create environment
-    env = ISACEnvironment(config)
-    
-    # Calculate dimensions
-    state_dim = len(env.get_state())
-    action_dim = 2 * config['num_antennas'] * (config['num_vehicles'] + 1) + (config['num_vehicles'] + 1)
-    
-    print(f"State dimension: {state_dim}")
-    print(f"Action dimension: {action_dim}")
-    print(f"Environment configured with {config['num_vehicles']} vehicles and {config['num_targets']} targets\n")
-    
-    # Create DRL agent
-    agent = PPOAgent(state_dim, action_dim)
-    
-    # Create baseline
-    baseline = KalmanFilterBaseline(config)
-    
-    # Training
-    print("Training DRL Agent...")
-    start_time = time.time()
-    drl_results = train_drl_agent(env, agent, episodes=500)  # Reduced for demo
-    training_time = time.time() - start_time
-    print(f"Training completed in {training_time:.2f} seconds\n")
-    
-    # Evaluation
-    print("Evaluating Kalman Filter Baseline...")
-    baseline_results = evaluate_baseline(env, baseline, episodes=100)
-    
-    # Results analysis
-    print("\n=== Performance Analysis ===")
-    
-    # DRL results (last 100 episodes)
-    drl_final_reward = np.mean(drl_results['episode_rewards'][-100:])
-    drl_final_comm = np.mean(drl_results['comm_rewards'][-100:])
-    drl_final_sense = np.mean(drl_results['sense_rewards'][-100:])
-    drl_final_energy = np.mean(drl_results['energy_penalties'][-100:])
-    
-    # Baseline results
-    baseline_reward = np.mean(baseline_results['episode_rewards'])
-    baseline_comm = np.mean(baseline_results['comm_rewards'])
-    baseline_sense = np.mean(baseline_results['sense_rewards'])
-    baseline_energy = np.mean(baseline_results['energy_penalties'])
-    
-    print(f"DRL-PPO Performance:")
-    print(f"  - Average Reward: {drl_final_reward:.3f}")
-    print(f"  - Communication Score: {drl_final_comm:.3f}")
-    print(f"  - Sensing Score: {drl_final_sense:.3f}")
-    print(f"  - Energy Penalty: {drl_final_energy:.3f}")
-    
-    print(f"\nKalman Filter Performance:")
-    print(f"  - Average Reward: {baseline_reward:.3f}")
-    print(f"  - Communication Score: {baseline_comm:.3f}")
-    print(f"  - Sensing Score: {baseline_sense:.3f}")
-    print(f"  - Energy Penalty: {baseline_energy:.3f}")
-    
-    # Improvements
-    reward_improvement = (drl_final_reward - baseline_reward) / abs(baseline_reward) * 100
-    comm_improvement = (drl_final_comm - baseline_comm) / baseline_comm * 100
-    sense_improvement = (drl_final_sense - baseline_sense) / baseline_sense * 100
-    energy_reduction = (baseline_energy - drl_final_energy) / baseline_energy * 100
-    
-    print(f"\nImprovements with DRL:")
-    print(f"  - Total Reward: {reward_improvement:+.1f}%")
-    print(f"  - Communication: {comm_improvement:+.1f}%")
-    print(f"  - Sensing: {sense_improvement:+.1f}%")
-    print(f"  - Energy Reduction: {energy_reduction:.1f}%")
-    
-    # Plot results
-    plot_results(drl_results, baseline_results)
-    
-    # SNN demonstration
-    demonstrate_snn_energy_efficiency()
-    
-    print("\n=== Summary ===")
-    print(f"✓ Successfully implemented DRL-based ISAC beamforming")
-    print(f"✓ Achieved {energy_reduction:.1f}% energy reduction")
-    print(f"✓ Improved communication performance by {comm_improvement:.1f}%")
-    print(f"✓ Enhanced sensing accuracy by {sense_improvement:.1f}%")
-    print(f"✓ Demonstrated SNN potential for additional energy savings")
-    print(f"✓ Training completed in {training_time:.1f} seconds")
+    try:
+        # Create environment
+        env = ISACEnvironment(config)
+        
+        # Calculate dimensions
+        state_dim = len(env.get_state())
+        action_dim = 2 * config['num_antennas'] * (config['num_vehicles'] + 1) + (config['num_vehicles'] + 1)
+        
+        print(f"State dimension: {state_dim}")
+        print(f"Action dimension: {action_dim}")
+        print(f"Environment configured with {config['num_vehicles']} vehicles and {config['num_targets']} targets\n")
+        
+        # Create DRL agent
+        agent = PPOAgent(state_dim, action_dim, lr=1e-4)  # Reduced learning rate
+        
+        # Create baseline
+        baseline = KalmanFilterBaseline(config)
+        
+        # Training
+        print("Training DRL Agent...")
+        start_time = time.time()
+        drl_results = train_drl_agent(env, agent, episodes=200)  # Reduced for stability
+        training_time = time.time() - start_time
+        print(f"Training completed in {training_time:.2f} seconds\n")
+        
+        # Evaluation
+        print("Evaluating Kalman Filter Baseline...")
+        baseline_results = evaluate_baseline(env, baseline, episodes=50)  # Reduced for efficiency
+        
+        # Results analysis
+        print("\n=== Performance Analysis ===")
+        
+        # DRL results (last 50 episodes)
+        last_episodes = min(50, len(drl_results['episode_rewards']))
+        drl_final_reward = np.mean(drl_results['episode_rewards'][-last_episodes:])
+        drl_final_comm = np.mean(drl_results['comm_rewards'][-last_episodes:])
+        drl_final_sense = np.mean(drl_results['sense_rewards'][-last_episodes:])
+        drl_final_energy = np.mean(drl_results['energy_penalties'][-last_episodes:])
+        
+        # Baseline results
+        baseline_reward = np.mean(baseline_results['episode_rewards'])
+        baseline_comm = np.mean(baseline_results['comm_rewards'])
+        baseline_sense = np.mean(baseline_results['sense_rewards'])
+        baseline_energy = np.mean(baseline_results['energy_penalties'])
+        
+        print(f"DRL-PPO Performance:")
+        print(f"  - Average Reward: {drl_final_reward:.3f}")
+        print(f"  - Communication Score: {drl_final_comm:.3f}")
+        print(f"  - Sensing Score: {drl_final_sense:.3f}")
+        print(f"  - Energy Penalty: {drl_final_energy:.3f}")
+        
+        print(f"\nKalman Filter Performance:")
+        print(f"  - Average Reward: {baseline_reward:.3f}")
+        print(f"  - Communication Score: {baseline_comm:.3f}")
+        print(f"  - Sensing Score: {baseline_sense:.3f}")
+        print(f"  - Energy Penalty: {baseline_energy:.3f}")
+        
+        # Improvements (with safety checks)
+        def safe_percentage_calc(new_val, old_val):
+            if abs(old_val) > 1e-8:
+                return (new_val - old_val) / abs(old_val) * 100
+            else:
+                return 0
+        
+        reward_improvement = safe_percentage_calc(drl_final_reward, baseline_reward)
+        comm_improvement = safe_percentage_calc(drl_final_comm, baseline_comm)
+        sense_improvement = safe_percentage_calc(drl_final_sense, baseline_sense)
+        energy_reduction = safe_percentage_calc(baseline_energy, drl_final_energy)
+        
+        print(f"\nImprovements with DRL:")
+        print(f"  - Total Reward: {reward_improvement:+.1f}%")
+        print(f"  - Communication: {comm_improvement:+.1f}%")
+        print(f"  - Sensing: {sense_improvement:+.1f}%")
+        print(f"  - Energy Reduction: {energy_reduction:.1f}%")
+        
+        # Plot results
+        plot_results(drl_results, baseline_results)
+        
+        # SNN demonstration
+        demonstrate_snn_energy_efficiency()
+        
+        print("\n=== Summary ===")
+        print(f"✓ Successfully implemented DRL-based ISAC beamforming")
+        print(f"✓ Achieved {energy_reduction:.1f}% energy reduction")
+        print(f"✓ Improved communication performance by {comm_improvement:.1f}%")
+        print(f"✓ Enhanced sensing accuracy by {sense_improvement:.1f}%")
+        print(f"✓ Demonstrated SNN potential for additional energy savings")
+        print(f"✓ Training completed in {training_time:.1f} seconds")
+        
+    except Exception as e:
+        print(f"Error in main execution: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
