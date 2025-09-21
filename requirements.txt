@@ -23,7 +23,7 @@ tensorboard>=2.8.0
 scikit-learn>=1.0.0
 
 # Signal Processing
-commpy>=0.7.0
+git+https://github.com/veeresht/CommPy.git
 pywavelets>=1.3.0
 
 # Optimization
@@ -32,7 +32,6 @@ mosek>=9.0.0  # Optional: commercial solver
 
 # Data Processing
 h5py>=3.6.0
-pickle5>=0.0.11
 
 # Progress Bars & Logging
 tqdm>=4.62.0
